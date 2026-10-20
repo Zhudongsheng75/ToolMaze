@@ -3,7 +3,7 @@
 Metric definitions:
 - TSR (Task Success Rate): pass rate for each mode
 - PRR (Perturbation Recovery Rate): hit-conditioned resolution rate
-- RC (Recovery Cost): all-sample normalized recovery burden
+- RC (Recovery Cost): exposure-conditioned normalized recovery burden
 """
 
 from typing import Dict, Any, List, Optional, Tuple
@@ -46,8 +46,11 @@ class MetricsCalculator:
         if mode != "P0":
             complexity = task_json.get("complexity", "C1")
             if not hit:
-                # No fault exposure means no recovery cost was incurred.
-                rc = 0.0
+                # No fault exposure => no recovery episode occurred, so RC is
+                # undefined for this run and is excluded from the RC average
+                # (exposure-conditioned, mirroring PRR). Use `hit`/exposure rate
+                # to report how often the model was actually tested on recovery.
+                rc = None
                 rc_case = "no_hit"
             else:
                 oracle_recovery_calls, oracle_method = self._compute_oracle_recovery_calls(
@@ -122,18 +125,19 @@ class MetricsCalculator:
         return resolved / total_hits
 
     def compute_rc(self, p_mode: str) -> Optional[float]:
-        """Compute all-sample normalized Recovery Cost.
+        """Compute exposure-conditioned normalized Recovery Cost.
 
-        For each non-P0 run:
-        - no hit: rc = 0
+        Only runs that actually hit a fault are counted (no-hit runs are
+        excluded from the denominator, mirroring PRR):
+        - no hit: excluded (rc is None)
         - hit and fail: rc = 1
         - hit and pass: rc = 1 - C_oracle / max(C_act, C_oracle)
 
-        RC_mode = mean(rc_run | runs in mode)
+        RC_mode = mean(rc_run | hit runs in mode)
         """
         samples = [
             r["rc"] for r in self.results
-            if r["mode"] == p_mode and r["rc"] is not None
+            if r["mode"] == p_mode and r["hit"] and r["rc"] is not None
         ]
         if not samples:
             return None
@@ -303,10 +307,10 @@ class MetricsCalculator:
         actual_recovery_calls: Optional[int],
         oracle_recovery_calls: Optional[int],
     ) -> Optional[float]:
-        """Compute per-run all-sample Recovery Cost.
+        """Compute per-run normalized Recovery Cost.
 
         Semantics:
-        - no-hit runs are handled earlier and assigned rc=0
+        - no-hit runs are handled earlier and assigned rc=None (excluded from RC)
         - hit-and-fail runs take the maximum cost rc=1
         - hit-and-pass runs pay only for detours beyond the oracle path
         """
@@ -531,9 +535,29 @@ class MetricsCalculator:
                 hits.append((i, event["tool_name"]))
         return hits
 
-    def _check_c1_abort(self, tool_events: List[Dict[str, Any]], hit_idx: int) -> bool:
-        """C1 permanent: resolved iff no successful calls follow the hit."""
-        return not any(e["success"] for e in tool_events[hit_idx + 1:])
+    def _check_c1_abort(
+        self,
+        tool_events: List[Dict[str, Any]],
+        hit_idx: int,
+        victim_tool: Optional[str] = None,
+    ) -> bool:
+        """C1 permanent: resolved iff the agent makes no successful call to any
+        tool *other than the victim* after the hit.
+
+        A retry of the victim itself is tolerated. This matters for P4
+        (implicit-permanent): a victim retry returns corrupted-but-error-free
+        data and would otherwise be counted as a "successful call", wrongly
+        marking a "detect -> retry-to-confirm -> graceful abort" run as
+        unresolved. Tolerating victim retries mirrors the TSR judge
+        (`_check_p2_p4_stop_after_victim`), which allows victim retries after
+        the hit and only forbids proceeding with *other* tools. Calling any
+        other tool means the agent kept going on corrupted data, i.e. did not
+        recover.
+        """
+        return not any(
+            e["success"] and e["tool_name"] != victim_tool
+            for e in tool_events[hit_idx + 1:]
+        )
 
     def _check_retry_succeeded(
         self, tool_events: List[Dict[str, Any]], hit_idx: int, victim_tool: Optional[str]
@@ -583,7 +607,7 @@ class MetricsCalculator:
         """Check whether a single perturbation hit was correctly recovered from."""
         if complexity == "C1":
             if mode in ("P2", "P4"):
-                return self._check_c1_abort(tool_events, hit_idx)
+                return self._check_c1_abort(tool_events, hit_idx, victim_tool)
             return self._check_retry_succeeded(tool_events, hit_idx, victim_tool)
         if mode in ("P1", "P3"):
             return (
